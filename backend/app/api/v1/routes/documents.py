@@ -203,54 +203,66 @@ async def stream_query_document(
 
     if not doc or doc.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
     if doc.status != "COMPLETED":
         raise HTTPException(status_code=400, detail="Document not ready")
 
-    # 1. Fetch History for Context
     history_models = await repo.get_chat_history(document_id, user.id)
-    # Take last 10 messages for context
     context_history = [{"role": m.role, "content": m.content} for m in history_models[-10:]]
-
-    # 2. Save User Message
     await repo.add_chat_message(document_id, user.id, "user", query)
 
     async def event_generator():
-        # We'll accumulate the response to save it at the end
-        full_response = []
+        import queue as _queue
+        import threading
 
-        # Run the blocking generator in a thread but yield chunks as they come
-        def _stream_wrapper():
-            # This runs in a separate thread
-            from app.infrastructure.db.session_sync import SessionLocal
-            with SessionLocal() as sync_session:
-                return rag_service.stream_query(sync_session, str(document_id), query, context_history)
+        full_response: list[str] = []
+        chunk_queue: _queue.Queue = _queue.Queue()
+        _DONE = object()
 
-        # Use asyncio.to_thread to run the generator and yield from it
-        # Actually, for a generator, we need a different approach to keep it streaming
-        loop = asyncio.get_event_loop()
-        generator = await loop.run_in_executor(None, _stream_wrapper)
+        # BUG FIX: the old pattern created a generator in one executor call and
+        # called next() on it from separate executor calls — generators are not
+        # thread-safe across multiple threads.  The correct approach is to run
+        # the entire generator in ONE dedicated thread and communicate via a Queue.
+        def _produce():
+            try:
+                from app.infrastructure.db.session_sync import SessionLocal
+                with SessionLocal() as sync_session:
+                    for chunk in rag_service.stream_query(
+                        sync_session, str(document_id), query, context_history
+                    ):
+                        chunk_queue.put(chunk)
+            except Exception as exc:
+                chunk_queue.put(exc)
+            finally:
+                chunk_queue.put(_DONE)
+
+        threading.Thread(target=_produce, daemon=True).start()
 
         while True:
-            # Get next chunk in a thread-safe way
-            chunk = await loop.run_in_executor(None, next, generator, None)
-            if chunk is None:
+            item = await asyncio.to_thread(chunk_queue.get)
+            if item is _DONE:
                 break
-            
-            full_response.append(chunk)
-            yield chunk
+            if isinstance(item, BaseException):
+                logger.error(f"Stream error for {document_id}: {item}")
+                break
+            full_response.append(item)
+            yield item
 
-        # 3. Save AI Message once complete
         complete_text = "".join(full_response)
-        def _save_ai_msg():
+
+        def _save():
             from app.infrastructure.db.session_sync import SessionLocal
-            with SessionLocal() as sync_session:
-                from app.infrastructure.db.models import ChatMessage
-                msg = ChatMessage(document_id=document_id, user_id=user.id, role="assistant", content=complete_text)
-                sync_session.add(msg)
-                sync_session.commit()
-        
-        await asyncio.to_thread(_save_ai_msg)
+            from app.infrastructure.db.models import ChatMessage
+            with SessionLocal() as s:
+                s.add(ChatMessage(
+                    document_id=document_id,
+                    user_id=user.id,
+                    role="assistant",
+                    content=complete_text,
+                ))
+                s.commit()
+
+        await asyncio.to_thread(_save)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

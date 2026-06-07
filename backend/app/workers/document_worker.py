@@ -14,173 +14,187 @@ logger = logging.getLogger(__name__)
 
 redis_client = redis.from_url(settings.redis_url)
 
-# Initialize services lazily inside the task for better DI and reliability
-def get_services():
-    return get_document_processor(), get_storage_service()
+
+def _publish(channel: str, task_id: str, status: str, **extra):
+    redis_client.publish(channel, json.dumps({"task_id": task_id, "status": status, **extra}))
+
 
 @celery_app.task(bind=True, name="process_document_task", max_retries=5)
 def process_document_task(self, document_id: str, request_id: str = "worker-gen"):
-    """Core background task for document analysis."""
+    """Core background task: extract → summarise → embed → index."""
     token = request_id_var.set(request_id)
     task_id = self.request.id
     channel = f"notifications_{task_id}"
 
-    # Lazy load services
-    processor, storage_service = get_services()
+    processor, storage_service = get_document_processor(), get_storage_service()
 
     try:
         with db_session_scope() as db:
             doc = db.query(Document).filter(Document.id == document_id).first()
             if not doc:
-                logger.error(f"Task {task_id} failed: Document {document_id} not found.")
+                logger.error(f"Task {task_id}: document {document_id} not found")
                 return {"error": "Document not found"}
 
             doc.status = "PROCESSING"
-            db.commit() # Commit status change immediately
-            
-            logger.info(f"Processing document: {document_id} (Task: {task_id})")
+            db.commit()
+            logger.info(f"Processing document {document_id} (task {task_id})")
 
-            # --- DE-DUPLICATION CHECK ---
+            # ---------------------------------------------------------- #
+            # DE-DUPLICATION                                              #
+            # ---------------------------------------------------------- #
             if doc.content_hash:
-                existing_doc = db.query(Document).filter(
+                existing = db.query(Document).filter(
                     Document.content_hash == doc.content_hash,
                     Document.status == "COMPLETED",
-                    Document.id != doc.id
+                    Document.id != doc.id,
                 ).first()
-                
-                if existing_doc:
-                    logger.info(f"RAG: Duplicate found (Hash: {doc.content_hash}). Cloning results from {existing_doc.id}")
-                    doc.raw_text = existing_doc.raw_text
-                    doc.analysis = existing_doc.analysis
+
+                if existing:
+                    logger.info(f"Duplicate found — cloning results from {existing.id}")
+                    doc.raw_text = existing.raw_text
+                    doc.analysis = existing.analysis
                     doc.status = "COMPLETED"
-                    
-                    # Clone embeddings using raw SQL for maximum performance
+
                     from sqlalchemy import text as sa_text
                     db.execute(sa_text("""
                         INSERT INTO data_document_embeddings (id, document_id, text, embedding, meta)
-                        SELECT gen_random_uuid(), :new_id, text, embedding, meta 
-                        FROM data_document_embeddings 
+                        SELECT gen_random_uuid(), :new_id, text, embedding, meta
+                        FROM data_document_embeddings
                         WHERE document_id = :old_id
-                    """), {"new_id": doc.id, "old_id": existing_doc.id})
-                    
-                    db.commit()
-                    return {"document_id": document_id, "status": "CLONED", "source": str(existing_doc.id)}
+                    """), {"new_id": doc.id, "old_id": existing.id})
 
-            # --- 1. TEXT EXTRACTION ---
+                    db.commit()
+
+                    # BUG FIX: notify WebSocket so the frontend doesn't hang
+                    _publish(channel, task_id, "COMPLETED", document_id=document_id)
+                    return {"document_id": document_id, "status": "CLONED", "source": str(existing.id)}
+
+            # ---------------------------------------------------------- #
+            # PHASE 1: TEXT EXTRACTION                                   #
+            # ---------------------------------------------------------- #
             doc.status = "EXTRACTING_TEXT"
             db.commit()
-            redis_client.publish(channel, json.dumps({"task_id": task_id, "status": "EXTRACTING_TEXT"}))
+            _publish(channel, task_id, "EXTRACTING_TEXT")
 
-            # Get file path
             path_to_process = async_to_sync(storage_service.get_file_path)(str(doc.id))
 
             if not os.path.exists(path_to_process):
                 doc.status = "FAILED"
-                logger.error(f"FILE MISSING: {path_to_process}")
                 raise Exception(f"NON_RETRYABLE: File not found at {path_to_process}")
 
-            # --- 2. AI ANALYSIS (WITH STREAMING) ---
+            # Call extraction directly so the status update is accurate
+            # (the old process_sync did both extraction + summary invisibly)
+            raw_text = processor.extract_text(path_to_process, mime_type=doc.content)
+
+            if not raw_text.strip():
+                raise Exception("NON_RETRYABLE: No text could be extracted from the document")
+
+            # ---------------------------------------------------------- #
+            # PHASE 2: AI SUMMARY (STREAMING)                            #
+            # ---------------------------------------------------------- #
             doc.status = "GENERATING_SUMMARY"
             db.commit()
-            redis_client.publish(channel, json.dumps({"task_id": task_id, "status": "GENERATING_SUMMARY"}))
+            _publish(channel, task_id, "GENERATING_SUMMARY")
 
             def on_summary_chunk(chunk: str):
-                # Publish each chunk to Redis for real-time UI updates
-                redis_client.publish(channel, json.dumps({
-                    "task_id": task_id,
-                    "status": "SUMMARY_CHUNK",
-                    "chunk": chunk
-                }))
+                _publish(channel, task_id, "SUMMARY_CHUNK", chunk=chunk)
 
-            logger.info(f"Starting AI analysis for {doc.file_name}")
-            result = processor.process_sync(path_to_process, mime_type=doc.content, on_chunk=on_summary_chunk)
-            
-            # Update document results
-            doc.raw_text = result.get("raw_text", "")
-            doc.analysis = result.get("analysis", {})
+            summary = processor.generate_summary_sync(raw_text, on_chunk=on_summary_chunk)
 
-            # --- 3. SEMANTIC INDEXING (RAG) ---
+            # Instructor-structured metadata (key_points, document_type, flags, etc.)
+            structured_metadata = processor.get_structured_analysis(raw_text)
+
+            doc.raw_text = raw_text
+            doc.analysis = {
+                "summary": summary,
+                "word_count": len(raw_text.split()),
+                "estimated_tokens": len(raw_text) // 4,
+                "contains_email": "@" in raw_text,
+                "contains_money": any(s in raw_text for s in ["$", "USD", "NGN", "€"]),
+                "ai_provider": settings.ai_provider,
+                **structured_metadata,
+            }
+
+            # ---------------------------------------------------------- #
+            # PHASE 3: CHUNKING COMPARISON + EMBEDDING                   #
+            # ---------------------------------------------------------- #
             doc.status = "GENERATING_EMBEDDINGS"
             db.commit()
-            redis_client.publish(channel, json.dumps({"task_id": task_id, "status": "GENERATING_EMBEDDINGS"}))
+            _publish(channel, task_id, "GENERATING_EMBEDDINGS")
 
             from app.dependencies import get_rag_service
             from llama_index.core import Document as LlamaDocument
-            from llama_index.core.node_parser import SentenceSplitter
-            
+
             rag_service = get_rag_service()
-            
-            # Split into chunks
-            parser = SentenceSplitter(chunk_size=512, chunk_overlap=50)
-            nodes = parser.get_nodes_from_documents([LlamaDocument(text=doc.raw_text)])
-            
-            logger.info(f"Split document into {len(nodes)} chunks for RAG indexing")
-            
-            # Index the nodes
+
+            # Compare fixed vs semantic chunking — stores comparison stats in analysis.
+            # Indexing uses fixed-size nodes (fast + predictable); comparison is for observability.
+            chunking_comparison, nodes = RAGService.compare_chunking_strategies(raw_text)
+            doc.analysis["chunking_comparison"] = chunking_comparison
+
+            logger.info(f"Chunking: {len(nodes)} fixed-size chunks")
+
+            # ---------------------------------------------------------- #
+            # PHASE 4: VECTOR INDEXING                                   #
+            # ---------------------------------------------------------- #
             doc.status = "INDEXING"
             db.commit()
-            redis_client.publish(channel, json.dumps({"task_id": task_id, "status": "INDEXING"}))
-            
+            _publish(channel, task_id, "INDEXING")
+
             rag_service.index_nodes(db, str(doc.id), nodes)
 
-            # --- 4. COMPLETION ---
+            # ---------------------------------------------------------- #
+            # COMPLETION                                                  #
+            # ---------------------------------------------------------- #
             doc.status = "COMPLETED"
-            
-            # Cost Optimization: Update User Token Count
+
             tokens_used = doc.analysis.get("estimated_tokens", 0)
             from app.infrastructure.db.models import User
-            db.query(User).filter(User.id == doc.owner_id).update({
-                User.total_tokens: User.total_tokens + tokens_used
-            })
-            
-            logger.info(f"Successfully processed and indexed document {document_id}. Tokens: {tokens_used}")
+            db.query(User).filter(User.id == doc.owner_id).update(
+                {User.total_tokens: User.total_tokens + tokens_used}
+            )
 
-            # Notify via Redis
-            notification_payload = {
-                "task_id": task_id,
-                "status": "COMPLETED",
-                "analysis": result.get("analysis", {})
-            }
-            redis_client.publish(channel, json.dumps(notification_payload))
+            db.commit()
+            logger.info(f"Document {document_id} completed. Tokens ≈ {tokens_used}")
 
+            _publish(channel, task_id, "COMPLETED", analysis=doc.analysis)
             return {"document_id": document_id, "status": "COMPLETED"}
 
     except Exception as e:
         error_msg = str(e)
-        is_transient = any(msg in error_msg for msg in ["Rate Limit", "429", "timeout", "connection", "AI Engine failed"])
-        is_permanent = "NON_RETRYABLE" in error_msg or "too short" in error_msg or "not found" in error_msg
+        is_permanent = (
+            "NON_RETRYABLE" in error_msg
+            or "too short" in error_msg
+            or "not found" in error_msg
+        )
+        is_transient = any(
+            kw in error_msg for kw in ["Rate Limit", "429", "timeout", "connection", "AI Engine failed"]
+        )
 
-        if is_permanent or not is_transient or self.request.retries >= self.max_retries:
-            # Permanent failure or max retries reached
+        if is_permanent or (not is_transient) or self.request.retries >= self.max_retries:
             logger.critical(f"Task {task_id} permanently failed: {error_msg}")
-            
-            # Ensure status is updated to FAILED in a fresh session if needed
             with db_session_scope() as db:
                 doc = db.query(Document).filter(Document.id == document_id).first()
                 if doc:
                     doc.status = "FAILED"
                     doc.error_message = error_msg
-            
-            error_payload = {"task_id": task_id, "status": "FAILED", "error": error_msg}
-            redis_client.publish(channel, json.dumps(error_payload))
+            _publish(channel, task_id, "FAILED", error=error_msg)
             return {"error": error_msg}
 
-        # Otherwise, retry
-        logger.warning(f"Task {task_id} encountered transient error. Retrying... Error: {error_msg}")
-        
-        # Mark as FAILED in DB so duplicate check allows re-upload if user is impatient
+        logger.warning(f"Task {task_id} transient error — retrying. Error: {error_msg}")
         with db_session_scope() as db:
             doc = db.query(Document).filter(Document.id == document_id).first()
             if doc:
                 doc.status = "FAILED"
-                doc.error_message = f"Transient Error (Retrying...): {error_msg}"
+                doc.error_message = f"Transient (retrying): {error_msg}"
 
-        retry_payload = {"task_id": task_id, "status": "RETRYING", "message": "Transient error, retrying..."}
-        redis_client.publish(channel, json.dumps(retry_payload))
-        
-        # Exponential backoff
-        countdown = 60 * (2 ** self.request.retries)
-        raise self.retry(exc=e, countdown=min(countdown, 3600))
-    
+        _publish(channel, task_id, "RETRYING", message="Transient error, retrying...")
+        countdown = min(60 * (2 ** self.request.retries), 3600)
+        raise self.retry(exc=e, countdown=countdown)
+
     finally:
-        request_id_var.reset(token)
+        request_id_var.reset(token)
+
+
+# Deferred import to avoid circular dependency at module load time
+from app.domain.services.rag_service import RAGService  # noqa: E402

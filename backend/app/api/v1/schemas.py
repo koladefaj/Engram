@@ -1,69 +1,71 @@
 from datetime import datetime
+from typing import Optional
 from pydantic import BaseModel, Field, EmailStr
 
-# --- AUTHENTICATION SCHEMAS ---
+# --- AUTHENTICATION ---
 
 class LoginRequest(BaseModel):
-    """Schema for user login credentials."""
-    email: EmailStr = Field(..., description="User email address")
+    email: EmailStr
     password: str = Field(..., min_length=8, max_length=100)
 
 
 class RegisterRequest(BaseModel):
-    """Schema for new user registration."""
-    email: EmailStr = Field(..., description="User email address")
+    email: EmailStr
     password: str = Field(..., min_length=8, max_length=100)
-    full_name: str | None = Field(None, description="User's full name for personalization")
+    full_name: str | None = None
+
 
 class ResgisterResponse(BaseModel):
-    """Schema for registration response."""
-    id: str = Field(..., description="Unique identifier of the newly created user")
-    email: EmailStr = Field(..., description="Email address of the newly created user")
-    full_name: str | None = Field(None, description="User's full name")
-    role: str = Field(..., description="Role assigned to the new user")
-    access_token: str | None = Field(None, description="JWT access token for auto-login")
-    refresh_token: str | None = Field(None, description="JWT refresh token for auto-login")
-    token_type: str = Field("bearer", description="Type of token issued")
-    message: str = Field(..., description="Confirmation message about account creation")
+    id: str
+    email: EmailStr
+    full_name: str | None = None
+    role: str
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_type: str = "bearer"
+    message: str
 
 
-
-# --- DOCUMENT SCHEMAS ---
+# --- DOCUMENTS ---
 
 class DocumentUploadResponse(BaseModel):
-    """Schema for document upload response."""
-    message: str = Field(..., description="Confirmation message about the upload")
-    document_id: str = Field(..., description="Unique identifier of the uploaded document")
-    task_id: str = Field(..., description="Identifier of the background analysis task")
-    status: str = Field(..., description="Current status of the document processing")
-    file_name: str = Field(..., description="Original name of the uploaded file")
-    url: str = Field(..., description="URL where the uploaded document can be accessed")
-    owner: EmailStr = Field(..., description="Email address of the user who owns the document")
+    message: str
+    document_id: str
+    task_id: str
+    status: str
+    file_name: str
+    url: str
+    owner: EmailStr
 
 
 class DocumentAnalysisResponse(BaseModel):
-    """Schema for document analysis results."""
-    id: str = Field(..., description="Unique identifier of the document")
-    file_name: str = Field(..., description="Original name of the uploaded file")
-    url: str = Field(..., description="URL where the uploaded document can be accessed")
-    owner: EmailStr = Field(..., description="Email address of the user who owns the document")
-    status: str = Field(..., description="Current status of the document processing")
-    analysis_results: dict = Field(..., description="Structured results from the document analysis")
-    created_at: datetime = Field(..., description="Timestamp when the document was uploaded")
+    id: str
+    file_name: str
+    url: str
+    owner: EmailStr
+    status: str
+    analysis_results: dict
+    created_at: datetime
 
-# --- RAG SCHEMAS ---
+
+# --- RAG ---
 
 class QueryRequest(BaseModel):
-    """Schema for querying a document."""
     query: str = Field(..., description="The question or query about the document")
 
+
 class SourceNode(BaseModel):
-    """Schema for a source reference node."""
-    text: str = Field(..., description="The content of the source chunk")
-    score: float = Field(..., description="Relevance score of the chunk")
-    metadata: dict = Field(..., description="Metadata associated with the chunk")
+    text: str
+    # BUG FIX: score was required but never returned by query() — now Optional with default
+    score: Optional[float] = Field(default=0.0, description="Re-ranker relevance score (0–1)")
+    metadata: dict = Field(default_factory=dict)
+
 
 class QueryResponse(BaseModel):
-    """Schema for query response."""
-    answer: str = Field(..., description="The AI-generated answer to the query")
-    sources: list[SourceNode] = Field(..., description="Reference chunks used to generate the answer")
+    answer: str
+    sources: list[SourceNode]
+    # New: CRAG confidence level so callers know when to distrust the answer
+    retrieval_confidence: str = Field(
+        default="unknown",
+        description="Retrieval quality: high | medium | low. Low triggers CRAG fallback prefix.",
+    )
